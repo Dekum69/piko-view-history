@@ -121,6 +121,14 @@ public class PikoHistoryDb extends SQLiteOpenHelper {
         });
     }
 
+    /** Deletes entries whose last view is older than {@code days}. A value of 0 keeps everything. */
+    public void pruneOlderThan(int days) {
+        if (days <= 0) return;
+        long cutoff = System.currentTimeMillis() - days * 24L * 60L * 60L * 1000L;
+        withFreshFallback(db ->
+                db.delete(TABLE, "viewed_at < ?", new String[]{String.valueOf(cutoff)}));
+    }
+
     /** All entries, newest first. */
     public List<Entry> getHistory() {
         return withFreshFallback(PikoHistoryDb::readHistory);

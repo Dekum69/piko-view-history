@@ -40,6 +40,9 @@ public class Settings {
     public static final BooleanSetting INSTANTS_DOWNLOAD = new BooleanSetting("instants_download", false);
     public static final BooleanSetting SAVE_DELETED_MESSAGES = new BooleanSetting("save_deleted_messages", false);
     public static final BooleanSetting SAVE_VIEW_HISTORY = new BooleanSetting("save_view_history", true);
+    /** Days to keep a viewed item; 0 keeps everything. */
+    public static final StringSetting SAVE_VIEW_HISTORY_RETENTION =
+            new StringSetting("save_view_history_retention", "0");
     public static final BooleanSetting DISABLE_STORIES = new BooleanSetting("disable_stories", false);
     public static final BooleanSetting DISABLE_HIGHLIGHTS = new BooleanSetting("disable_highlights", false);
     public static final BooleanSetting HIDE_STORIES_TRAY = new BooleanSetting("hide_stories_tray", false);

@@ -31,6 +31,7 @@ import java.util.List;
 import app.morphe.extension.instagram.constants.UI;
 import app.morphe.extension.instagram.db.PikoHistoryDb;
 import app.morphe.extension.instagram.settings.preference.widgets.InstagramPreferenceStyle;
+import app.morphe.extension.instagram.utils.Pref;
 import app.morphe.extension.crimera.PikoUtils;
 import app.morphe.extension.shared.Logger;
 import app.morphe.extension.shared.Utils;
@@ -61,8 +62,9 @@ public class HistoryActivity extends Activity {
 
         setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_USER);
 
-        history = PikoHistoryDb.getInstance(this).getHistory();
-
+        PikoHistoryDb db = PikoHistoryDb.getInstance(this);
+        db.pruneOlderThan(Pref.saveViewHistoryRetentionDays());
+        history = db.getHistory();
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(InstagramPreferenceStyle.backgroundColor());

@@ -292,6 +292,13 @@ public class ScreenBuilder {
                     )
             );
             addPreference(
+                    helper.listPreference(
+                            str("piko_view_history_retention"),
+                            str("piko_view_history_retention_desc"),
+                            Settings.SAVE_VIEW_HISTORY_RETENTION
+                    )
+            );
+            addPreference(
                     helper.buttonPreference(
                             str("piko_view_history"),
                             "",

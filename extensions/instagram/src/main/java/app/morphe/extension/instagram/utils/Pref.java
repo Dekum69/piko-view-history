@@ -67,6 +67,15 @@ public class Pref {
         return SharedPref.getBooleanPref(Settings.SAVE_VIEW_HISTORY);
     }
 
+    /** Days a viewed item is kept for; 0 means keep forever. */
+    public static int saveViewHistoryRetentionDays() {
+        try {
+            return Integer.parseInt(SharedPref.getStringPref(Settings.SAVE_VIEW_HISTORY_RETENTION));
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
     public static boolean openLinksExternally() {
         return SharedPref.getBooleanPref(Settings.OPEN_LINKS_EXTERNALLY);
     }

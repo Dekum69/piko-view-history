@@ -66,9 +66,10 @@ public class ViewHistoryHook {
 
             DB_WRITER.execute(() -> {
                 try {
-                    PikoHistoryDb.getInstance(PikoUtils.getContext())
-                            .logView(mediaPk, postType, ownerUsername, ownerId, thumbUrl,
-                                    caption, permalink);
+                    PikoHistoryDb db = PikoHistoryDb.getInstance(PikoUtils.getContext());
+                    db.pruneOlderThan(Pref.saveViewHistoryRetentionDays());
+                    db.logView(mediaPk, postType, ownerUsername, ownerId, thumbUrl,
+                            caption, permalink);
                 } catch (Exception e) {
                     Logger.printException(() -> "View history write failure", e);
                 }

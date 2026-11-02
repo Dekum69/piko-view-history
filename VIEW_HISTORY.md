@@ -14,12 +14,15 @@ Ported from the (closed but unmerged) piko PR
 | `Log feed posts to view history` | Feed `viewed_impression` callback (only fires once a post is actually on screen, not for prefetched rows) |
 | `Log Reels to view history` | `ClipsViewerViewPagerListener.onPageSelected` |
 | `Log stories to view history` | `ReelViewerFragment.onCurrentActiveItemBound` |
-| `View history` (settings) | Adds the History section + `save_view_history` toggle |
+| `View history` (settings) | Adds the History section, the `save_view_history` toggle and the retention picker |
 
 The viewer is a plain-framework two-column grid (`HistoryActivity`) opened from
 **Piko settings → History → View history**, or from the History row on the settings landing page.
 
 - Newest first, 2000 rows max, `media_pk` is unique so re-viewing an item moves it to the top.
+- **Auto-delete history** setting: keep forever, or drop items after 1 day, 2 days, 3 days,
+  1 week, 2 weeks, 1 month or 3 months. Pruning runs when a new item is logged and when the
+  history screen opens, so lowering the limit takes effect immediately.
 - Long-press a card to copy the link or delete it; the toolbar Clear button wipes everything.
 - Stories reopen in Instagram's own story viewer; posts/Reels open through Instagram's URL handler.
 - Nothing leaves the device: `piko_view_history.db` is a local SQLite file, thumbnails are cached

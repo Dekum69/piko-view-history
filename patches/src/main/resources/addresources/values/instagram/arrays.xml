@@ -279,4 +279,26 @@
         <item>disable</item>
     </string-array>
 
+    <string-array name="piko_array_view_history_retention">
+        <item>@string/piko_history_retention_forever</item>
+        <item>@string/piko_history_retention_1_day</item>
+        <item>@string/piko_history_retention_2_days</item>
+        <item>@string/piko_history_retention_3_days</item>
+        <item>@string/piko_history_retention_1_week</item>
+        <item>@string/piko_history_retention_2_weeks</item>
+        <item>@string/piko_history_retention_1_month</item>
+        <item>@string/piko_history_retention_3_months</item>
+    </string-array>
+
+    <string-array name="piko_array_view_history_retention_val">
+        <item>0</item>
+        <item>1</item>
+        <item>2</item>
+        <item>3</item>
+        <item>7</item>
+        <item>14</item>
+        <item>30</item>
+        <item>90</item>
+    </string-array>
+
 </resources>
