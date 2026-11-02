@@ -1,61 +1,87 @@
-# Maintaining this fork
+# Updating this fork — checklist
 
-This repository is a real fork of [crimera/piko](https://github.com/crimera/piko): `main` is upstream
-plus two commits of ours. That is what makes updates cheap.
+Everything below assumes the repo is at `C:\Users\itzde\piko-view-history\piko`.
+If it is somewhere else, `cd` there first.
 
-```
-main
- ├─ ... upstream history (a0ed9a5a = v3.10.0 when this fork was made)
- ├─ feat(Instagram): local view history for posts, Reels and Stories   <- 20 files, the feature
- └─ chore: build patches workflow + docs                                <- tooling only
-```
+Tools you need (already installed on this PC): **Git** and **GitHub CLI (`gh`)**, logged in as
+`Dekum69`. Check with `gh auth status`.
 
-The feature commit touches only these paths, so a rebase can never conflict anywhere else:
+---
 
-```
-extensions/instagram/src/main/java/app/morphe/extension/instagram/db/PikoHistoryDb.java
-extensions/instagram/src/main/java/app/morphe/extension/instagram/patches/history/
-extensions/instagram/src/main/java/app/morphe/extension/instagram/settings/
-extensions/instagram/src/main/java/app/morphe/extension/instagram/constants/Constants.java
-extensions/instagram/src/main/java/app/morphe/extension/instagram/utils/Pref.java
-extensions/instagram/stub/src/main/java/com/instagram/common/session/UserSession.java
-patches/src/main/kotlin/app/crimera/patches/instagram/misc/history/
-patches/src/main/kotlin/app/crimera/patches/instagram/entity/mediadata/Fingerprint.kt
-patches/src/main/resources/addresources/values/instagram/strings.xml
-```
+## When does anything need doing?
 
-## 1. Update to a new piko release
+| Situation | What you do |
+|---|---|
+| **piko released a new version** (check https://github.com/crimera/piko/releases) | Scenario 1 |
+| **Instagram released a new version** | Scenario 2 (usually nothing) |
+| Both | Scenario 1, then Scenario 2 |
+| Nothing changed, you just want a fresh `.mpp` | Scenario 3 |
 
-Once, in your clone:
+---
 
-```bash
-git remote add upstream https://github.com/crimera/piko.git
-```
+## Scenario 1 — piko released an update
 
-Every time piko ships something new:
+This is the normal one. Five commands, then a download.
 
-```bash
+```powershell
+cd C:\Users\itzde\piko-view-history\piko
 git fetch upstream
 git switch main
 git rebase upstream/main
+git push
+```
+
+What happens:
+
+1. `git fetch upstream` downloads piko's new commits (does not touch your files).
+2. `git rebase upstream/main` replays your two/three commits on top of piko's new code.
+3. `git push` uploads it, which **automatically starts the Build patches workflow**.
+
+Then:
+
+4. Open https://github.com/Dekum69/piko-view-history/actions
+5. Wait ~3 minutes for the green tick on the newest run.
+6. Click the run → scroll to **Artifacts** → download **`piko-patches-view-history`**.
+7. Unzip it — inside is `patches-3.10.0.mpp` (name follows `gradle.properties`).
+8. Import that `.mpp` in Morphe Manager, patch your APK, install.
+
+### If the rebase stops with a conflict
+
+Git prints `CONFLICT (content): Merge conflict in <file>`. Conflicts can only be in the
+view-history files, never anywhere else.
+
+```powershell
+git status                       # lists the conflicted files
+# open each one, look for <<<<<<< ======= >>>>>>> and keep BOTH sides:
+#   piko's new code around our lines, our lines where they belong
+git add <the files you fixed>
+git rebase --continue
+```
+
+If it gets messy and you want to start over:
+
+```powershell
+git rebase --abort               # back to exactly how it was before
+```
+
+Nothing is lost by aborting — the rebase is not pushed until you `git push`.
+
+### If `git push` is rejected
+
+```powershell
+git pull --rebase
 git push --force-with-lease
 ```
 
-- Conflicts, if any, will be in the files listed above — they are small edits, not rewrites.
-  Take upstream's version of everything around them and keep our hunks.
-- If a rebase goes sideways: `git rebase --abort` and try again, or
-  `git merge upstream/main` instead (uglier history, same result).
-- The push starts the **Build patches** workflow automatically. When it finishes, download the
-  `piko-patches-view-history` artifact — that is your new `.mpp`.
+`--force-with-lease` is safe: it refuses to overwrite if someone else pushed in the meantime.
 
-## 2. Patch a new Instagram version
+---
 
-Two independent things can break when Instagram updates:
+## Scenario 2 — Instagram released an update
 
-**a) The patch bundle itself** (only if piko changed): covered by step 1.
+Usually **nothing to do**. Patch the new APK with the same `.mpp` you already have.
 
-**b) The fingerprints** (if Instagram renamed/moved the hooked methods). Symptom, from the Manager
-log or the CLI:
+Only if Morphe Manager fails with a message like:
 
 ```
 Feed view history: viewed_impression not found
@@ -63,67 +89,72 @@ Reels view history: clips item lookup not found
 Stories view history: ReelItem media field not found
 ```
 
-Each patch anchors on a trace string, so find the new location by searching the new APK's dex for
-the same string. Decompile with jadx, or open the APK in MT Manager and search the string:
+…does a patch need fixing. That message tells you exactly which file to edit:
 
-| Patch | Search for this string | File to edit |
-|---|---|---|
-| Feed | `viewed_impression` | `patches/.../misc/history/FeedViewHistoryPatch.kt` |
-| Reels | `ClipsViewerViewPagerListener.onPageSelected` | `.../ReelsViewHistoryPatch.kt` |
-| Stories | `ReelViewerFragment.onCurrentActiveItemBound` | `.../StoriesViewHistoryPatch.kt` |
+| Error contains | File to edit |
+|---|---|
+| `viewed_impression` | `patches/src/main/kotlin/app/crimera/patches/instagram/misc/history/FeedViewHistoryPatch.kt` |
+| `clips item lookup` | `.../misc/history/ReelsViewHistoryPatch.kt` |
+| `ReelItem media field` | `.../misc/history/StoriesViewHistoryPatch.kt` |
 
-Then update the `Fingerprint(...)` in that file to match what you found: `returnType`,
-`parameters` (JVM descriptors like `"I"`, `"Ljava/lang/Object;"`, `"J"`), and `strings`. The
-`execute { }` block below it usually needs no change — it locates the casts/fields itself.
+How to fix:
 
-For the Feed patch, the method must still cast an argument to `MediaData`'s media class and to the
-carousel class, and the class must still have a `UserSession` field. For Stories, `ReelItem` must
-still have exactly one `final` field of the media type.
+1. Open the new Instagram APK in **MT Manager** (or jadx on PC) and search the dex for the
+   trace string that patch uses — `viewed_impression`,
+   `ClipsViewerViewPagerListener.onPageSelected`, or `ReelViewerFragment.onCurrentActiveItemBound`.
+2. Open that method and note its **return type** and **parameter types**.
+3. Update the `Fingerprint(...)` at the top of the file:
 
-Push, let Actions rebuild, re-patch.
-
-> Do **not** rename `GetPostTypeExtensionFingerprint` back to `getPostType`. It must stay on
-> `getPostTypeKey` (the method containing the `"A7Q"` literal); otherwise the patch overwrites the
-> `"clips"` literal and Reels stop being recognised.
-
-## 3. Build / patch locally instead of on Actions
-
-Building needs a GitHub token with `read:packages` (the Morphe patcher library lives on GitHub
-Packages) and JDK 17 + Android SDK 36:
-
-```bash
-export GITHUB_TOKEN=ghp_...        # read:packages
-./gradlew buildAndroid
-# -> patches/build/libs/patches-<version>.mpp
+```kotlin
+private object FeedViewedImpressionFingerprint : Fingerprint(
+    returnType = "V",                                             // <-- from step 2
+    parameters = listOf("Ljava/lang/Object;", "J", "Ljava/lang/Object;"),  // <-- from step 2
+    strings = listOf("viewed_impression", "instagram_organic_viewed_impression"),
+)
 ```
 
-Patching a split APK (`.apkm`) is easiest with **Morphe Manager ≥ 1.33.0-dev.1** on the phone:
-import the `.mpp`, pick the APKM, patch, install. Morphe CLI expects a single `.apk`; for `.apkm`
-you would have to merge the splits first.
+4. Save, then Scenario 3 to rebuild.
 
-## 4. If the repository is ever lost
+The `execute { ... }` block underneath the fingerprint normally needs no change — it locates the
+casts and fields itself.
 
-The feature is self-contained — 9 new files and 11 edited ones. To recreate it:
+> Never rename `GetPostTypeExtensionFingerprint` back to `getPostType`. It must stay
+> `getPostTypeKey` (the method with the `"A7Q"` literal), otherwise Reels stop being detected.
 
-```bash
-git clone https://github.com/crimera/piko.git
-cd piko
-git checkout -b view-history
-# apply the saved diff
-git apply view-history.patch
+---
+
+## Scenario 3 — just rebuild without changing anything
+
+```powershell
+cd C:\Users\itzde\piko-view-history\piko
+git push
 ```
 
-`view-history.patch` is the export of the feature commit. Regenerate it any time with:
+Or trigger it by hand: https://github.com/Dekum69/piko-view-history/actions →
+**Build patches** → **Run workflow**.
 
-```bash
-git diff upstream/main..HEAD -- ':!VIEW_HISTORY.md' ':!MAINTENANCE.md' \
-  ':!.github' > view-history.patch
-```
+Then download the artifact as in Scenario 1, steps 4–8.
 
-The four Java classes under `patches/history/` plus `PikoHistoryDb`, and the five Kotlin patches,
-are also readable standalone if you prefer to copy them file by file.
+---
 
-## 5. Version bump (optional)
+## Applying the `.mpp` (same every time)
 
-`gradle.properties` holds `version = 3.10.0`, which is also the `.mpp` filename. Bump it when you
-want to tell builds apart, e.g. `3.10.0-viewhistory.1`.
+1. Morphe Manager **1.33.0-dev.1 or newer**.
+2. Select the Instagram APK/APKM.
+3. Import the `.mpp`, keep **View history** enabled.
+4. Patch → install. If installing over an existing patched build fails, uninstall it first
+   (the signature differs from the Play Store copy anyway).
+
+---
+
+## Useful facts
+
+- **Where the feature lives:** 9 new files + 11 edited ones. `git show --stat a1caaf61` lists them.
+- **Export the feature as a patch:** `git format-patch upstream/main..HEAD --stdout > view-history.patch`
+- **Restore on a clean piko checkout:** `git clone https://github.com/crimera/piko.git && cd piko && git am <path>\view-history.patch`
+- **See what you changed vs piko:** `git log --oneline upstream/main..HEAD` and `git diff upstream/main..HEAD --stat`
+- **Undo the last commit (keep files):** `git reset --soft HEAD~1`
+- **Discard everything local and match GitHub:** `git fetch origin && git reset --hard origin/main`
+- **Version in the `.mpp` name:** `gradle.properties` → `version = 3.10.0`. Bump it if you want
+  different builds to have different file names.
+- **Docs:** `VIEW_HISTORY.md` (what the feature does), `MAINTENANCE.md` (this file).
