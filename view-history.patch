@@ -1,0 +1,1359 @@
+From a1caaf610ad95a9e473d07ecb233a9b7e3748578 Mon Sep 17 00:00:00 2001
+From: Dekum69 <87270170+Dekum69@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 10:17:53 +0545
+Subject: [PATCH] feat(Instagram): local view history for posts, Reels and
+ Stories
+
+Ported from PR #1952 onto current main. Records every feed post, Reel and
+Story the user views into a local SQLite database and shows them in a
+two-column viewer activity reachable from Piko settings -> History.
+
+- ViewHistoryHook: injected logger plus the history entry point
+- HistoryActivity: plain-framework grid, paged, clear/delete/copy link
+- ThumbnailCache: async loader with an in-memory LruCache
+- PikoHistoryDb: 2000-row store keyed by media_pk, self-healing schema
+- FeedViewHistoryPatch: viewed_impression callback
+- ReelsViewHistoryPatch: ClipsViewerViewPagerListener.onPageSelected
+- StoriesViewHistoryPatch: ReelViewerFragment.onCurrentActiveItemBound
+- ViewHistorySettingsPatch / HistoryResourcePatch: settings + manifest
+- GetPostTypeExtensionFingerprint: getPostTypeKey (not getPostType), which
+  keeps the "clips" literal intact so Reels stay detected
+---
+ .../instagram/constants/Constants.java        |   1 +
+ .../extension/instagram/db/PikoHistoryDb.java | 181 ++++++++++
+ .../patches/history/HistoryActivity.java      | 335 ++++++++++++++++++
+ .../patches/history/ThumbnailCache.java       | 101 ++++++
+ .../patches/history/ViewHistoryHook.java      | 105 ++++++
+ .../instagram/settings/Settings.java          |   1 +
+ .../instagram/settings/SettingsActivity.java  |   2 +
+ .../instagram/settings/SettingsStatus.java    |   5 +
+ .../settings/preference/ScreenBuilder.java    |  31 ++
+ .../preference/fragments/FragmentHook.java    |   2 +
+ .../preference/widgets/ButtonPref.java        |  10 +-
+ .../extension/instagram/utils/Pref.java       |   4 +
+ .../instagram/common/session/UserSession.java |   4 +
+ .../instagram/entity/mediadata/Fingerprint.kt |   2 +-
+ .../misc/history/FeedViewHistoryPatch.kt      |  85 +++++
+ .../misc/history/HistoryResourcePatch.kt      |  27 ++
+ .../misc/history/ReelsViewHistoryPatch.kt     |  89 +++++
+ .../misc/history/StoriesViewHistoryPatch.kt   |  78 ++++
+ .../misc/history/ViewHistorySettingsPatch.kt  |  27 ++
+ .../addresources/values/instagram/strings.xml |  14 +
+ 20 files changed, 1102 insertions(+), 2 deletions(-)
+ create mode 100644 extensions/instagram/src/main/java/app/morphe/extension/instagram/db/PikoHistoryDb.java
+ create mode 100644 extensions/instagram/src/main/java/app/morphe/extension/instagram/patches/history/HistoryActivity.java
+ create mode 100644 extensions/instagram/src/main/java/app/morphe/extension/instagram/patches/history/ThumbnailCache.java
+ create mode 100644 extensions/instagram/src/main/java/app/morphe/extension/instagram/patches/history/ViewHistoryHook.java
+ create mode 100644 patches/src/main/kotlin/app/crimera/patches/instagram/misc/history/FeedViewHistoryPatch.kt
+ create mode 100644 patches/src/main/kotlin/app/crimera/patches/instagram/misc/history/HistoryResourcePatch.kt
+ create mode 100644 patches/src/main/kotlin/app/crimera/patches/instagram/misc/history/ReelsViewHistoryPatch.kt
+ create mode 100644 patches/src/main/kotlin/app/crimera/patches/instagram/misc/history/StoriesViewHistoryPatch.kt
+ create mode 100644 patches/src/main/kotlin/app/crimera/patches/instagram/misc/history/ViewHistorySettingsPatch.kt
+
+diff --git a/extensions/instagram/src/main/java/app/morphe/extension/instagram/constants/Constants.java b/extensions/instagram/src/main/java/app/morphe/extension/instagram/constants/Constants.java
+index 5e4d7bc0..d09f7a69 100644
+--- a/extensions/instagram/src/main/java/app/morphe/extension/instagram/constants/Constants.java
++++ b/extensions/instagram/src/main/java/app/morphe/extension/instagram/constants/Constants.java
+@@ -49,6 +49,7 @@ public class Constants {
+     public static final String PIKO_FRAGMENT_ABOUT = "piko_frag_about";
+     public static final String PIKO_FRAGMENT_ACTION_BAR = "piko_frag_action_bar";
+     public static final String PIKO_FRAGMENT_DM = "piko_frag_dm";
++    public static final String PIKO_FRAGMENT_HISTORY = "piko_frag_history";
+     public static final String PIKO_FRAGMENT_FILTER_CONTENT = "piko_frag_filter_content";
+     public static final String PIKO_FRAGMENT_REC_FLAGS = "piko_frag_rec_flags";
+     public static final String PIKO_FRAGMENT_INSTANTS = "piko_frag_instants";
+diff --git a/extensions/instagram/src/main/java/app/morphe/extension/instagram/db/PikoHistoryDb.java b/extensions/instagram/src/main/java/app/morphe/extension/instagram/db/PikoHistoryDb.java
+new file mode 100644
+index 00000000..8cc2e07e
+--- /dev/null
++++ b/extensions/instagram/src/main/java/app/morphe/extension/instagram/db/PikoHistoryDb.java
+@@ -0,0 +1,181 @@
++/*
++ * Copyright (C) 2026 piko <https://github.com/crimera/piko>
++ *
++ * See the included NOTICE file for GPLv3 §7(b) terms that apply to this code.
++ */
++
++package app.morphe.extension.instagram.db;
++
++import android.content.ContentValues;
++import android.content.Context;
++import android.database.Cursor;
++import android.database.sqlite.SQLiteDatabase;
++import android.database.sqlite.SQLiteException;
++import android.database.sqlite.SQLiteOpenHelper;
++
++import java.util.ArrayList;
++import java.util.List;
++import java.util.function.Function;
++
++import app.morphe.extension.shared.Logger;
++
++/** Feed posts, Reels and Stories the user has viewed, newest kept up to {@link #MAX_ROWS}. */
++public class PikoHistoryDb extends SQLiteOpenHelper {
++
++    private static final String DB_NAME = "piko_view_history.db";
++    private static final int DB_VERSION = 2;
++    private static final String TABLE = "view_history";
++
++    private static final int MAX_ROWS = 2000;
++
++    private static volatile PikoHistoryDb instance;
++
++    public static PikoHistoryDb getInstance(Context context) {
++        if (instance == null) {
++            synchronized (PikoHistoryDb.class) {
++                if (instance == null) {
++                    instance = new PikoHistoryDb(context.getApplicationContext());
++                }
++            }
++        }
++        return instance;
++    }
++
++    private final Context context;
++
++    private PikoHistoryDb(Context context) {
++        super(context, DB_NAME, null, DB_VERSION);
++        this.context = context;
++    }
++
++    @Override
++    public void onCreate(SQLiteDatabase db) {
++        db.execSQL(
++            "CREATE TABLE " + TABLE + " (" +
++            "id INTEGER PRIMARY KEY AUTOINCREMENT," +
++            "media_pk TEXT NOT NULL UNIQUE," +
++            "post_type TEXT NOT NULL," +
++            "owner_username TEXT," +
++            "owner_id TEXT," +
++            "thumb_url TEXT," +
++            "caption TEXT," +
++            "permalink TEXT NOT NULL," +
++            "viewed_at INTEGER NOT NULL" +
++            ")"
++        );
++        db.execSQL("CREATE INDEX idx_viewed_at ON " + TABLE + "(viewed_at)");
++    }
++
++    @Override
++    public void onUpgrade(SQLiteDatabase db, int oldVersion, int newVersion) {
++        recreate(db);
++    }
++
++    @Override
++    public void onDowngrade(SQLiteDatabase db, int oldVersion, int newVersion) {
++        recreate(db);
++    }
++
++    /** History is disposable: start fresh instead of migrating. */
++    private void recreate(SQLiteDatabase db) {
++        db.execSQL("DROP TABLE IF EXISTS " + TABLE);
++        onCreate(db);
++    }
++
++    /**
++     * Runs {@code query}, and if the database doesn't match what this build expects (e.g. a
++     * table left by an older build), deletes it and runs {@code query} once more on a fresh one.
++     */
++    private <T> T withFreshFallback(Function<SQLiteDatabase, T> query) {
++        try {
++            return query.apply(getWritableDatabase());
++        } catch (SQLiteException | IllegalArgumentException e) {
++            Logger.printException(() -> "View history database unusable, starting fresh", e);
++            close();
++            context.deleteDatabase(DB_NAME);
++            return query.apply(getWritableDatabase());
++        }
++    }
++
++    /** Adds a viewed item, or moves an already logged one to the top. */
++    public void logView(String mediaPk, String postType, String ownerUsername, String ownerId,
++                        String thumbUrl, String caption, String permalink) {
++        ContentValues cv = new ContentValues();
++        cv.put("media_pk", mediaPk);
++        cv.put("post_type", postType);
++        cv.put("owner_username", ownerUsername);
++        cv.put("owner_id", ownerId);
++        cv.put("thumb_url", thumbUrl);
++        cv.put("caption", caption);
++        cv.put("permalink", permalink);
++        cv.put("viewed_at", System.currentTimeMillis());
++
++        withFreshFallback(db -> {
++            db.insertWithOnConflict(TABLE, null, cv, SQLiteDatabase.CONFLICT_REPLACE);
++            db.execSQL(
++                "DELETE FROM " + TABLE + " WHERE id IN (" +
++                "SELECT id FROM " + TABLE + " ORDER BY viewed_at DESC LIMIT -1 OFFSET " + MAX_ROWS +
++                ")"
++            );
++            return null;
++        });
++    }
++
++    /** All entries, newest first. */
++    public List<Entry> getHistory() {
++        return withFreshFallback(PikoHistoryDb::readHistory);
++    }
++
++    private static List<Entry> readHistory(SQLiteDatabase db) {
++        List<Entry> result = new ArrayList<>();
++        try (Cursor c = db.query(TABLE, null, null, null, null, null, "viewed_at DESC")) {
++            while (c.moveToNext()) {
++                result.add(new Entry(
++                    c.getLong(c.getColumnIndexOrThrow("id")),
++                    c.getString(c.getColumnIndexOrThrow("media_pk")),
++                    c.getString(c.getColumnIndexOrThrow("post_type")),
++                    c.getString(c.getColumnIndexOrThrow("owner_username")),
++                    c.getString(c.getColumnIndexOrThrow("owner_id")),
++                    c.getString(c.getColumnIndexOrThrow("thumb_url")),
++                    c.getString(c.getColumnIndexOrThrow("caption")),
++                    c.getString(c.getColumnIndexOrThrow("permalink")),
++                    c.getLong(c.getColumnIndexOrThrow("viewed_at"))
++                ));
++            }
++        }
++        return result;
++    }
++
++    public void deleteEntry(long id) {
++        withFreshFallback(db -> db.delete(TABLE, "id = ?", new String[]{String.valueOf(id)}));
++    }
++
++    public void clearAll() {
++        withFreshFallback(db -> db.delete(TABLE, null, null));
++    }
++
++    public static final class Entry {
++        public final long id;
++        public final String mediaPk;
++        public final String postType;
++        public final String ownerUsername;
++        public final String ownerId;
++        public final String thumbUrl;
++        public final String caption;
++        public final String permalink;
++        public final long viewedAt;
++
++        Entry(long id, String mediaPk, String postType, String ownerUsername, String ownerId,
++              String thumbUrl, String caption, String permalink, long viewedAt) {
++            this.id = id;
++            this.mediaPk = mediaPk;
++            this.postType = postType;
++            this.ownerUsername = ownerUsername;
++            this.ownerId = ownerId;
++            this.thumbUrl = thumbUrl;
++            this.caption = caption;
++            this.permalink = permalink;
++            this.viewedAt = viewedAt;
++        }
++    }
++}
+diff --git a/extensions/instagram/src/main/java/app/morphe/extension/instagram/patches/history/HistoryActivity.java b/extensions/instagram/src/main/java/app/morphe/extension/instagram/patches/history/HistoryActivity.java
+new file mode 100644
+index 00000000..5f300d52
+--- /dev/null
++++ b/extensions/instagram/src/main/java/app/morphe/extension/instagram/patches/history/HistoryActivity.java
+@@ -0,0 +1,335 @@
++/*
++ * Copyright (C) 2026 piko <https://github.com/crimera/piko>
++ *
++ * See the included NOTICE file for GPLv3 §7(b) terms that apply to this code.
++ */
++
++package app.morphe.extension.instagram.patches.history;
++
++import static app.morphe.extension.instagram.utils.IgStr.str;
++
++import android.app.Activity;
++import android.app.AlertDialog;
++import android.content.Intent;
++import android.content.pm.ActivityInfo;
++import android.graphics.drawable.GradientDrawable;
++import android.net.Uri;
++import android.os.Bundle;
++import android.text.format.DateFormat;
++import android.util.TypedValue;
++import android.view.Gravity;
++import android.view.View;
++import android.widget.ImageView;
++import android.widget.LinearLayout;
++import android.widget.ScrollView;
++import android.widget.TextView;
++
++import java.util.ArrayList;
++import java.util.Date;
++import java.util.List;
++
++import app.morphe.extension.instagram.constants.UI;
++import app.morphe.extension.instagram.db.PikoHistoryDb;
++import app.morphe.extension.instagram.settings.preference.widgets.InstagramPreferenceStyle;
++import app.morphe.extension.crimera.PikoUtils;
++import app.morphe.extension.shared.Logger;
++import app.morphe.extension.shared.Utils;
++import app.morphe.extension.shared.ui.Dim;
++
++/**
++ * Two-column grid of viewed items, rendered a page at a time as the user scrolls. Uses plain
++ * framework views: Instagram's R8 build strips the androidx classes (e.g. RecyclerView) that an
++ * extension would link against.
++ */
++public class HistoryActivity extends Activity {
++
++    private static final int PAGE_SIZE = 40;
++    private static final String STORIES_URL_HANDLER =
++            "com.instagram.urlhandlers.stories.StoriesUrlHandlerActivity";
++
++    private List<PikoHistoryDb.Entry> history;
++    private int renderedCount;
++    private int thumbnailWidth;
++    private LinearLayout leftColumn;
++    private LinearLayout rightColumn;
++    private int leftHeightEstimate;
++    private int rightHeightEstimate;
++
++    @Override
++    protected void onCreate(Bundle savedInstanceState) {
++        super.onCreate(savedInstanceState);
++
++        setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_USER);
++
++        history = PikoHistoryDb.getInstance(this).getHistory();
++
++        LinearLayout root = new LinearLayout(this);
++        root.setOrientation(LinearLayout.VERTICAL);
++        root.setBackgroundColor(InstagramPreferenceStyle.backgroundColor());
++        InstagramPreferenceStyle.applySystemBarStyle(this);
++
++        // Toolbar
++        LinearLayout toolbar = new LinearLayout(this);
++        toolbar.setOrientation(LinearLayout.HORIZONTAL);
++        toolbar.setBackgroundColor(InstagramPreferenceStyle.backgroundColor());
++        toolbar.setPadding(Dim.dp8, Dim.dp8, Dim.dp8, Dim.dp8);
++
++        ImageView back = new ImageView(this);
++        LinearLayout.LayoutParams backParams = new LinearLayout.LayoutParams(Dim.dp48, Dim.dp48);
++        backParams.gravity = Gravity.CENTER_VERTICAL;
++        back.setLayoutParams(backParams);
++        UI.setThemedIcon(back, UI.DRAWABLE_ARROW_BACK);
++        back.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
++        back.setOnClickListener(v -> finish());
++
++        TextView title = new TextView(this);
++        title.setText(str("piko_view_history"));
++        title.setTextSize(TypedValue.COMPLEX_UNIT_PX, PikoUtils.spToPixels(20));
++        title.setTextColor(InstagramPreferenceStyle.primaryTextColor());
++        LinearLayout.LayoutParams titleParams = new LinearLayout.LayoutParams(
++            LinearLayout.LayoutParams.WRAP_CONTENT,
++            LinearLayout.LayoutParams.WRAP_CONTENT,
++            1
++        );
++        titleParams.gravity = Gravity.CENTER_VERTICAL;
++        titleParams.leftMargin = Dim.dp8 / 2;
++        title.setLayoutParams(titleParams);
++
++        toolbar.addView(back);
++        toolbar.addView(title);
++
++        TextView clear = new TextView(this);
++        clear.setText(str("piko_clear_view_history"));
++        clear.setTextSize(TypedValue.COMPLEX_UNIT_PX, PikoUtils.spToPixels(16));
++        clear.setTextColor(InstagramPreferenceStyle.primaryTextColor());
++        clear.setPadding(Dim.dp8, Dim.dp8, Dim.dp8, Dim.dp8);
++        LinearLayout.LayoutParams clearParams = new LinearLayout.LayoutParams(
++            LinearLayout.LayoutParams.WRAP_CONTENT,
++            LinearLayout.LayoutParams.WRAP_CONTENT
++        );
++        clearParams.gravity = Gravity.CENTER_VERTICAL;
++        clear.setLayoutParams(clearParams);
++        clear.setOnClickListener(v -> new AlertDialog.Builder(InstagramPreferenceStyle.dialogContext(this))
++            .setMessage(str("piko_clear_view_history_confirm"))
++            .setPositiveButton(str("piko_clear_view_history"), (d, w) -> {
++                PikoHistoryDb.getInstance(this).clearAll();
++                recreate();
++            })
++            .setNegativeButton(str("piko_cancel"), null)
++            .show());
++        toolbar.addView(clear);
++        root.addView(toolbar);
++
++        if (history.isEmpty()) {
++            TextView empty = new TextView(this);
++            empty.setText(str("piko_no_view_history"));
++            empty.setGravity(Gravity.CENTER);
++            empty.setPadding(Dim.dp8 * 2, Dim.dp8 * 4, Dim.dp8 * 2, Dim.dp8 * 4);
++            empty.setTextColor(InstagramPreferenceStyle.secondaryTextColor());
++            root.addView(empty, new LinearLayout.LayoutParams(
++                LinearLayout.LayoutParams.MATCH_PARENT,
++                LinearLayout.LayoutParams.MATCH_PARENT,
++                1
++            ));
++        } else {
++            ScrollView scrollView = new ScrollView(this);
++            scrollView.setBackgroundColor(InstagramPreferenceStyle.backgroundColor());
++
++            LinearLayout grid = new LinearLayout(this);
++            grid.setOrientation(LinearLayout.HORIZONTAL);
++            grid.setPadding(Dim.dp4, Dim.dp4, Dim.dp4, Dim.dp4);
++
++            leftColumn = new LinearLayout(this);
++            leftColumn.setOrientation(LinearLayout.VERTICAL);
++            rightColumn = new LinearLayout(this);
++            rightColumn.setOrientation(LinearLayout.VERTICAL);
++
++            grid.addView(leftColumn, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
++            grid.addView(rightColumn, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
++
++            thumbnailWidth = getResources().getDisplayMetrics().widthPixels / 2;
++            addNextPage();
++            scrollView.setOnScrollChangeListener((v, x, y, oldX, oldY) -> {
++                if (y + v.getHeight() >= grid.getHeight() - v.getHeight()) addNextPage();
++            });
++
++            scrollView.addView(grid, new LinearLayout.LayoutParams(
++                LinearLayout.LayoutParams.MATCH_PARENT,
++                LinearLayout.LayoutParams.WRAP_CONTENT
++            ));
++            root.addView(scrollView, new LinearLayout.LayoutParams(
++                LinearLayout.LayoutParams.MATCH_PARENT,
++                LinearLayout.LayoutParams.MATCH_PARENT,
++                1
++            ));
++        }
++
++        root.setOnApplyWindowInsetsListener((v, insets) -> {
++            v.setPadding(0, insets.getSystemWindowInsetTop(), 0, 0);
++            return insets;
++        });
++
++        setContentView(root);
++    }
++
++    private static String typeLabel(String postType) {
++        if ("REEL".equals(postType)) return str("piko_history_type_reel");
++        if ("STORY".equals(postType)) return str("piko_history_type_story");
++        return str("piko_history_type_post");
++    }
++
++    private void openEntry(PikoHistoryDb.Entry entry) {
++        if ("STORY".equals(entry.postType) && openStory(entry)) return;
++        String link = webLink(entry);
++        if (link == null) return;
++        try {
++            startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(link))
++                    .setPackage(getPackageName()));
++        } catch (Exception e) {
++            Logger.printException(() -> "Failed to open " + link, e);
++        }
++    }
++
++    /**
++     * Opens a story in Instagram's story viewer, the way a story shared in a chat opens. The web
++     * story link only reaches the owner's profile, and Instagram's router drops
++     * {@code instagram://stories} links, so start the (non-exported) handler behind it directly.
++     */
++    private boolean openStory(PikoHistoryDb.Entry entry) {
++        String token = ViewHistoryHook.sessionToken;
++        if (token == null || entry.ownerId == null || entry.mediaPk == null) return false;
++        try {
++            Bundle extras = new Bundle();
++            extras.putString("original_url", "instagram://stories?user_id=" + entry.ownerId
++                    + "&media_id=" + entry.mediaPk);
++            extras.putString("IgSessionManager.SESSION_TOKEN_KEY", token);
++            startActivity(new Intent()
++                    .setClassName(getPackageName(), STORIES_URL_HANDLER)
++                    .putExtra("com.instagram.url.extra.BUNDLE", extras));
++            return true;
++        } catch (Exception e) {
++            Logger.printException(() -> "Failed to open story " + entry.mediaPk, e);
++            return false;
++        }
++    }
++
++    private void addNextPage() {
++        int end = Math.min(renderedCount + PAGE_SIZE, history.size());
++        for (; renderedCount < end; renderedCount++) {
++            addCard(history.get(renderedCount));
++        }
++    }
++
++    private void showEntryMenu(PikoHistoryDb.Entry entry, View card, LinearLayout column) {
++        String webLink = webLink(entry);
++        List<String> items = new ArrayList<>();
++        if (webLink != null) items.add(str("piko_history_copy_link"));
++        items.add(str("piko_delete"));
++        new AlertDialog.Builder(InstagramPreferenceStyle.dialogContext(this))
++            .setItems(items.toArray(new String[0]), (d, which) -> {
++                if (webLink != null && which == 0) {
++                    Utils.setClipboard(webLink);
++                    Utils.showToastShort(str("piko_copied"));
++                } else {
++                    confirmDelete(entry.id, card, column);
++                }
++            })
++            .show();
++    }
++
++    /** The instagram.com link. */
++    private static String webLink(PikoHistoryDb.Entry entry) {
++        String permalink = entry.permalink;
++        return permalink == null || permalink.isEmpty() ? null : permalink;
++    }
++
++    private void confirmDelete(long id, View card, LinearLayout column) {
++        new AlertDialog.Builder(InstagramPreferenceStyle.dialogContext(this))
++            .setMessage(str("piko_delete_view_history_confirm"))
++            .setPositiveButton(str("piko_delete"), (d, w) -> {
++                PikoHistoryDb.getInstance(this).deleteEntry(id);
++                column.removeView(card);
++            })
++            .setNegativeButton(str("piko_cancel"), null)
++            .show();
++    }
++
++    /** Converts dp to pixels, for values Dim does not have a constant for. */
++    private int dp(int value) {
++        return Math.round(value * getResources().getDisplayMetrics().density);
++    }
++
++    /** Appends a card to the column that is estimated to be shorter. */
++    private void addCard(PikoHistoryDb.Entry entry) {
++        LinearLayout card = new LinearLayout(this);
++        card.setOrientation(LinearLayout.VERTICAL);
++        LinearLayout.LayoutParams cardParams = new LinearLayout.LayoutParams(
++            LinearLayout.LayoutParams.MATCH_PARENT,
++            LinearLayout.LayoutParams.WRAP_CONTENT
++        );
++        cardParams.setMargins(Dim.dp4, Dim.dp4, Dim.dp4, Dim.dp4);
++        card.setLayoutParams(cardParams);
++
++        GradientDrawable cardBackground = new GradientDrawable();
++        cardBackground.setColor(UI.getThemedColour("igds_color_secondary_background"));
++        cardBackground.setCornerRadius(dp(12));
++        card.setBackground(cardBackground);
++        card.setClipToOutline(true);
++
++        ImageView thumb = new ImageView(this);
++        thumb.setScaleType(ImageView.ScaleType.FIT_CENTER);
++        thumb.setAdjustViewBounds(true);
++        thumb.setMinimumHeight(dp(96));
++        thumb.setLayoutParams(new LinearLayout.LayoutParams(
++            LinearLayout.LayoutParams.MATCH_PARENT,
++            LinearLayout.LayoutParams.WRAP_CONTENT
++        ));
++        ThumbnailCache.load(thumb, entry.thumbUrl, thumbnailWidth);
++
++        LinearLayout textBlock = new LinearLayout(this);
++        textBlock.setOrientation(LinearLayout.VERTICAL);
++        textBlock.setPadding(Dim.dp8, Dim.dp6, Dim.dp8, Dim.dp8);
++
++        if (entry.caption != null && !entry.caption.isEmpty()) {
++            TextView captionView = new TextView(this);
++            captionView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
++            captionView.setTextColor(InstagramPreferenceStyle.primaryTextColor());
++            captionView.setMaxLines(2);
++            captionView.setText(entry.caption);
++            textBlock.addView(captionView);
++        }
++
++        String who = entry.ownerUsername != null && !entry.ownerUsername.isEmpty()
++                ? "@" + entry.ownerUsername : str("piko_unknown");
++        TextView metaView = new TextView(this);
++        metaView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
++        metaView.setTextColor(InstagramPreferenceStyle.secondaryTextColor());
++        metaView.setPadding(0, Dim.dp2, 0, 0);
++        metaView.setText(who + "\n" + typeLabel(entry.postType) + "  ·  "
++                + DateFormat.format("MMM dd, HH:mm", new Date(entry.viewedAt)));
++
++        textBlock.addView(metaView);
++
++        card.addView(thumb);
++        card.addView(textBlock);
++
++        card.setOnClickListener(v -> openEntry(entry));
++
++        boolean placeLeft = leftHeightEstimate <= rightHeightEstimate;
++        LinearLayout targetColumn = placeLeft ? leftColumn : rightColumn;
++        card.setOnLongClickListener(v -> {
++            showEntryMenu(entry, card, targetColumn);
++            return true;
++        });
++
++        // Thumbnail sizes are unknown until they load, so balance on a fixed estimate.
++        int estimate = dp(96) + dp(48);
++        if (placeLeft) {
++            leftColumn.addView(card);
++            leftHeightEstimate += estimate;
++        } else {
++            rightColumn.addView(card);
++            rightHeightEstimate += estimate;
++        }
++    }
++}
+diff --git a/extensions/instagram/src/main/java/app/morphe/extension/instagram/patches/history/ThumbnailCache.java b/extensions/instagram/src/main/java/app/morphe/extension/instagram/patches/history/ThumbnailCache.java
+new file mode 100644
+index 00000000..4ee9e4f3
+--- /dev/null
++++ b/extensions/instagram/src/main/java/app/morphe/extension/instagram/patches/history/ThumbnailCache.java
+@@ -0,0 +1,101 @@
++/*
++ * Copyright (C) 2026 piko <https://github.com/crimera/piko>
++ *
++ * See the included NOTICE file for GPLv3 §7(b) terms that apply to this code.
++ */
++
++package app.morphe.extension.instagram.patches.history;
++
++import android.graphics.Bitmap;
++import android.graphics.BitmapFactory;
++import android.os.Handler;
++import android.os.Looper;
++import android.util.LruCache;
++import android.widget.ImageView;
++
++import java.io.ByteArrayOutputStream;
++import java.io.InputStream;
++import java.net.HttpURLConnection;
++import java.net.URL;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++
++import app.morphe.extension.shared.Logger;
++
++/** Async thumbnail loader with a memory cache, downsampling images to the card width. */
++final class ThumbnailCache {
++
++    private static final LruCache<String, Bitmap> CACHE =
++            new LruCache<String, Bitmap>((int) (Runtime.getRuntime().maxMemory() / 16)) {
++                @Override
++                protected int sizeOf(String key, Bitmap bitmap) {
++                    return bitmap.getByteCount();
++                }
++            };
++    private static final Handler MAIN_HANDLER = new Handler(Looper.getMainLooper());
++    private static final ExecutorService EXECUTOR = Executors.newFixedThreadPool(4);
++
++    private ThumbnailCache() {
++    }
++
++    static void load(ImageView imageView, String url, int targetWidth) {
++        imageView.setTag(url);
++        imageView.setImageDrawable(null);
++        if (url == null || url.isEmpty()) return;
++
++        Bitmap cached = CACHE.get(url);
++        if (cached != null) {
++            imageView.setImageBitmap(cached);
++            return;
++        }
++
++        EXECUTOR.execute(() -> {
++            Bitmap bitmap = null;
++            try {
++                bitmap = decode(download(url), targetWidth);
++            } catch (Exception e) {
++                Logger.printInfo(() -> "Thumbnail load failed: " + url, e);
++            }
++            if (bitmap == null) return;
++
++            CACHE.put(url, bitmap);
++            Bitmap result = bitmap;
++            MAIN_HANDLER.post(() -> {
++                if (url.equals(imageView.getTag())) {
++                    imageView.setImageBitmap(result);
++                }
++            });
++        });
++    }
++
++    private static byte[] download(String url) throws Exception {
++        HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
++        connection.setConnectTimeout(15000);
++        connection.setReadTimeout(15000);
++        try (InputStream input = connection.getInputStream()) {
++            ByteArrayOutputStream output = new ByteArrayOutputStream();
++            byte[] buffer = new byte[16 * 1024];
++            int read;
++            while ((read = input.read(buffer)) != -1) {
++                output.write(buffer, 0, read);
++            }
++            return output.toByteArray();
++        } finally {
++            connection.disconnect();
++        }
++    }
++
++    private static Bitmap decode(byte[] data, int targetWidth) {
++        BitmapFactory.Options options = new BitmapFactory.Options();
++        options.inJustDecodeBounds = true;
++        BitmapFactory.decodeByteArray(data, 0, data.length, options);
++
++        int sampleSize = 1;
++        while (targetWidth > 0 && options.outWidth / (sampleSize * 2) >= targetWidth) {
++            sampleSize *= 2;
++        }
++        options.inJustDecodeBounds = false;
++        options.inSampleSize = sampleSize;
++        return BitmapFactory.decodeByteArray(data, 0, data.length, options);
++    }
++}
+diff --git a/extensions/instagram/src/main/java/app/morphe/extension/instagram/patches/history/ViewHistoryHook.java b/extensions/instagram/src/main/java/app/morphe/extension/instagram/patches/history/ViewHistoryHook.java
+new file mode 100644
+index 00000000..7493d079
+--- /dev/null
++++ b/extensions/instagram/src/main/java/app/morphe/extension/instagram/patches/history/ViewHistoryHook.java
+@@ -0,0 +1,105 @@
++/*
++ * Copyright (C) 2026 piko <https://github.com/crimera/piko>
++ *
++ * See the included NOTICE file for GPLv3 §7(b) terms that apply to this code.
++ */
++
++package app.morphe.extension.instagram.patches.history;
++
++import android.content.Context;
++import android.content.Intent;
++
++import com.instagram.common.session.UserSession;
++
++import java.util.List;
++import java.util.concurrent.Callable;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++
++import app.morphe.extension.crimera.PikoUtils;
++import app.morphe.extension.instagram.db.PikoHistoryDb;
++import app.morphe.extension.instagram.entity.ImageData;
++import app.morphe.extension.instagram.entity.MediaData;
++import app.morphe.extension.instagram.entity.UserData;
++import app.morphe.extension.instagram.patches.Links;
++import app.morphe.extension.instagram.utils.Pref;
++import app.morphe.extension.shared.Logger;
++
++@SuppressWarnings("unused")
++public class ViewHistoryHook {
++
++    private static final int THUMBNAIL_MIN_WIDTH = 360;
++    private static final ExecutorService DB_WRITER = Executors.newSingleThreadExecutor();
++
++    /** The logged-in session's token, which Instagram's in-app story opener requires. */
++    static volatile String sessionToken;
++
++    public static void openHistory(Context ctx) {
++        try {
++            if (ctx == null) ctx = PikoUtils.getContext();
++            if (ctx == null) return;
++            Intent intent = new Intent(ctx, HistoryActivity.class);
++            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
++            ctx.startActivity(intent);
++        } catch (Exception e) {
++            Logger.printException(() -> "openHistory failure", e);
++        }
++    }
++
++    /** Records a viewed item. Injected into the feed, Reels and Stories viewers. */
++    public static void logMediaView(Object mediaObject, UserSession userSession, int carouselIndex) {
++        try {
++            if (userSession != null) sessionToken = userSession.getToken();
++            if (mediaObject == null || !Pref.saveViewHistory()) return;
++
++            MediaData mediaData = new MediaData(mediaObject, userSession);
++            String mediaPk = mediaData.getPostID();
++            if (mediaPk == null || "0".equals(mediaPk)) return;
++            String postType = mediaData.getPostType().name();
++
++            UserData user = orNull(mediaData::getUserData);
++            String ownerUsername = user != null ? orNull(user::getUsername) : null;
++            String ownerId = user != null ? orNull(user::getUserId) : null;
++            String thumbUrl = orNull(() -> thumbnailUrl(mediaData));
++            String caption = orNull(mediaData::getDescriptionText);
++            String permalink = Links.generatePostLink(mediaData, carouselIndex);
++
++            DB_WRITER.execute(() -> {
++                try {
++                    PikoHistoryDb.getInstance(PikoUtils.getContext())
++                            .logView(mediaPk, postType, ownerUsername, ownerId, thumbUrl,
++                                    caption, permalink);
++                } catch (Exception e) {
++                    Logger.printException(() -> "View history write failure", e);
++                }
++            });
++        } catch (Exception e) {
++            Logger.printException(() -> "logMediaView failure", e);
++        }
++    }
++
++    private static <T> T orNull(Callable<T> getter) {
++        try {
++            return getter.call();
++        } catch (Exception e) {
++            return null;
++        }
++    }
++
++    /** The smallest image variant that is still sharp in a half-width grid card. */
++    @SuppressWarnings("unchecked")
++    private static String thumbnailUrl(MediaData mediaData) throws Exception {
++        List<ImageData> variants = mediaData.getImageVariants();
++        if (variants == null || variants.isEmpty()) return null;
++        ImageData best = null;
++        int bestWidth = Integer.MAX_VALUE;
++        for (ImageData variant : variants) {
++            Integer width = variant.getWidth();
++            if (width != null && width >= THUMBNAIL_MIN_WIDTH && width < bestWidth) {
++                best = variant;
++                bestWidth = width;
++            }
++        }
++        return (best != null ? best : variants.get(0)).getUrl();
++    }
++}
+diff --git a/extensions/instagram/src/main/java/app/morphe/extension/instagram/settings/Settings.java b/extensions/instagram/src/main/java/app/morphe/extension/instagram/settings/Settings.java
+index db9c9114..ddd661b4 100644
+--- a/extensions/instagram/src/main/java/app/morphe/extension/instagram/settings/Settings.java
++++ b/extensions/instagram/src/main/java/app/morphe/extension/instagram/settings/Settings.java
+@@ -39,6 +39,7 @@ public class Settings {
+     public static final BooleanSetting VIEW_DM_ANONYMOUSLY = new BooleanSetting("view_dm_anonymously", false);
+     public static final BooleanSetting INSTANTS_DOWNLOAD = new BooleanSetting("instants_download", false);
+     public static final BooleanSetting SAVE_DELETED_MESSAGES = new BooleanSetting("save_deleted_messages", false);
++    public static final BooleanSetting SAVE_VIEW_HISTORY = new BooleanSetting("save_view_history", true);
+     public static final BooleanSetting DISABLE_STORIES = new BooleanSetting("disable_stories", false);
+     public static final BooleanSetting DISABLE_HIGHLIGHTS = new BooleanSetting("disable_highlights", false);
+     public static final BooleanSetting HIDE_STORIES_TRAY = new BooleanSetting("hide_stories_tray", false);
+diff --git a/extensions/instagram/src/main/java/app/morphe/extension/instagram/settings/SettingsActivity.java b/extensions/instagram/src/main/java/app/morphe/extension/instagram/settings/SettingsActivity.java
+index 003090d0..5bf28a81 100644
+--- a/extensions/instagram/src/main/java/app/morphe/extension/instagram/settings/SettingsActivity.java
++++ b/extensions/instagram/src/main/java/app/morphe/extension/instagram/settings/SettingsActivity.java
+@@ -225,6 +225,8 @@ public class SettingsActivity extends Activity {
+                 screenBuilder.buildActionBarSection();
+             } else if (fragment_name.equals(Constants.PIKO_FRAGMENT_DM)) {
+                 screenBuilder.dmSection();
++            } else if (fragment_name.equals(Constants.PIKO_FRAGMENT_HISTORY)) {
++                screenBuilder.historySection();
+             } else if (fragment_name.equals(Constants.PIKO_FRAGMENT_FILTER_CONTENT)) {
+                 screenBuilder.filterContentSection();
+             } else if (fragment_name.equals(Constants.PIKO_FRAGMENT_REC_FLAGS)) {
+diff --git a/extensions/instagram/src/main/java/app/morphe/extension/instagram/settings/SettingsStatus.java b/extensions/instagram/src/main/java/app/morphe/extension/instagram/settings/SettingsStatus.java
+index 768acb5e..b3396f4a 100644
+--- a/extensions/instagram/src/main/java/app/morphe/extension/instagram/settings/SettingsStatus.java
++++ b/extensions/instagram/src/main/java/app/morphe/extension/instagram/settings/SettingsStatus.java
+@@ -69,6 +69,11 @@ public class SettingsStatus {
+     public static void inboxLock() { inboxLock = true; }
+     public static boolean dmSection(){ return markChatAsRead || unlimitedReplaysOnEphemeralMedia || saveDeletedMessages || inboxLock ;}
+ 
++    //History section.
++    public static boolean saveViewHistory = false;
++    public static void saveViewHistory() { saveViewHistory = true; }
++    public static boolean historySection(){ return saveViewHistory; }
++
+     //Story section
+     public static boolean customiseStoryTimestamp = false;
+     public static void customiseStoryTimestamp() {
+diff --git a/extensions/instagram/src/main/java/app/morphe/extension/instagram/settings/preference/ScreenBuilder.java b/extensions/instagram/src/main/java/app/morphe/extension/instagram/settings/preference/ScreenBuilder.java
+index 03460ae5..852688ba 100644
+--- a/extensions/instagram/src/main/java/app/morphe/extension/instagram/settings/preference/ScreenBuilder.java
++++ b/extensions/instagram/src/main/java/app/morphe/extension/instagram/settings/preference/ScreenBuilder.java
+@@ -280,6 +280,27 @@ public class ScreenBuilder {
+         }
+     }
+ 
++    public void historySection() {
++        if (!(SettingsStatus.historySection())) return;
++
++        if (SettingsStatus.saveViewHistory) {
++            addPreference(
++                    helper.switchPreference(
++                            str("piko_save_view_history"),
++                            str("piko_save_view_history_desc"),
++                            Settings.SAVE_VIEW_HISTORY
++                    )
++            );
++            addPreference(
++                    helper.buttonPreference(
++                            str("piko_view_history"),
++                            "",
++                            "view_history"
++                    )
++            );
++        }
++    }
++
+     public void ghostSection() {
+         if (!(SettingsStatus.ghostSection())) return;
+ 
+@@ -1134,6 +1155,16 @@ public class ScreenBuilder {
+             );
+         }
+ 
++        if (SettingsStatus.historySection()){
++            addPreference(
++                    helper.categoryPreference(
++                            str("piko_category_history"),
++                            "",
++                            Constants.PIKO_FRAGMENT_HISTORY
++                    )
++            );
++        }
++
+         if (SettingsStatus.storySection()){
+             addPreference(
+                     helper.categoryPreference(
+diff --git a/extensions/instagram/src/main/java/app/morphe/extension/instagram/settings/preference/fragments/FragmentHook.java b/extensions/instagram/src/main/java/app/morphe/extension/instagram/settings/preference/fragments/FragmentHook.java
+index 789ddcf9..a645605b 100644
+--- a/extensions/instagram/src/main/java/app/morphe/extension/instagram/settings/preference/fragments/FragmentHook.java
++++ b/extensions/instagram/src/main/java/app/morphe/extension/instagram/settings/preference/fragments/FragmentHook.java
+@@ -45,6 +45,8 @@ public class FragmentHook {
+             actionBarTitleKey = "piko_category_action_bar";
+         }else if(key.equals(Constants.PIKO_FRAGMENT_DM)){
+             actionBarTitleKey = "piko_category_dm";
++        }else if(key.equals(Constants.PIKO_FRAGMENT_HISTORY)){
++            actionBarTitleKey = "piko_category_history";
+         }else if(key.equals(Constants.PIKO_FRAGMENT_FILTER_CONTENT)){
+             actionBarTitleKey = "piko_category_filter_content";
+         }else if(key.equals(Constants.PIKO_FRAGMENT_REC_FLAGS)){
+diff --git a/extensions/instagram/src/main/java/app/morphe/extension/instagram/settings/preference/widgets/ButtonPref.java b/extensions/instagram/src/main/java/app/morphe/extension/instagram/settings/preference/widgets/ButtonPref.java
+index b66bdbf3..2524b7dc 100644
+--- a/extensions/instagram/src/main/java/app/morphe/extension/instagram/settings/preference/widgets/ButtonPref.java
++++ b/extensions/instagram/src/main/java/app/morphe/extension/instagram/settings/preference/widgets/ButtonPref.java
+@@ -28,6 +28,7 @@ import app.morphe.extension.instagram.constants.UI;
+ import app.morphe.extension.instagram.utils.InstaUtils;
+ import app.morphe.extension.instagram.patches.focusLock.FocusLockDialogs;
+ import app.morphe.extension.instagram.patches.dm.SavedMessagesHook;
++import app.morphe.extension.instagram.patches.history.ViewHistoryHook;
+ 
+ import static app.morphe.extension.instagram.utils.IgStr.str;
+ 
+@@ -103,6 +104,9 @@ public class ButtonPref extends Preference {
+                     } else if (key.equals("view_deleted_messages")) {
+                         SavedMessagesHook.openDeletedMessages(context);
+ 
++                    } else if (key.equals("view_history")) {
++                        ViewHistoryHook.openHistory(context);
++
+                     } else if (isFragmentNavigation(key)) {
+                         FragmentHook.startFragment(key);
+ 
+@@ -173,7 +177,8 @@ public class ButtonPref extends Preference {
+                 || key.equals("piko_view_saved_instants")
+                 || key.equals("piko_pref_add_font")
+                 || key.equals("piko_pref_delete_font")
+-                || key.equals("view_deleted_messages")));
++                || key.equals("view_deleted_messages")
++                || key.equals("view_history")));
+     }
+ 
+     private static boolean hasPressedHighlight(String key) {
+@@ -229,6 +234,9 @@ public class ButtonPref extends Preference {
+         if (key.equals(Constants.PIKO_FRAGMENT_DM)) {
+             return UI.DRAWABLE_SHARE_TO_DIRECT;
+         }
++        if (key.equals(Constants.PIKO_FRAGMENT_HISTORY)) {
++            return UI.DRAWABLE_HISTORY_ICON;
++        }
+         if (key.equals(Constants.PIKO_FRAGMENT_FILTER_CONTENT)) {
+             return UI.DRAWABLE_SHARE_TO_REEL;
+         }
+diff --git a/extensions/instagram/src/main/java/app/morphe/extension/instagram/utils/Pref.java b/extensions/instagram/src/main/java/app/morphe/extension/instagram/utils/Pref.java
+index ddd215bf..e3a954a6 100644
+--- a/extensions/instagram/src/main/java/app/morphe/extension/instagram/utils/Pref.java
++++ b/extensions/instagram/src/main/java/app/morphe/extension/instagram/utils/Pref.java
+@@ -63,6 +63,10 @@ public class Pref {
+         return SharedPref.getBooleanPref(Settings.SAVE_DELETED_MESSAGES);
+     }
+ 
++    public static boolean saveViewHistory() {
++        return SharedPref.getBooleanPref(Settings.SAVE_VIEW_HISTORY);
++    }
++
+     public static boolean openLinksExternally() {
+         return SharedPref.getBooleanPref(Settings.OPEN_LINKS_EXTERNALLY);
+     }
+diff --git a/extensions/instagram/stub/src/main/java/com/instagram/common/session/UserSession.java b/extensions/instagram/stub/src/main/java/com/instagram/common/session/UserSession.java
+index 4498f6b5..845f5f1a 100644
+--- a/extensions/instagram/stub/src/main/java/com/instagram/common/session/UserSession.java
++++ b/extensions/instagram/stub/src/main/java/com/instagram/common/session/UserSession.java
+@@ -4,4 +4,8 @@ public class UserSession {
+     public String getUserId() {
+         return "";
+     }
++
++    public String getToken() {
++        return "";
++    }
+ }
+\ No newline at end of file
+diff --git a/patches/src/main/kotlin/app/crimera/patches/instagram/entity/mediadata/Fingerprint.kt b/patches/src/main/kotlin/app/crimera/patches/instagram/entity/mediadata/Fingerprint.kt
+index 1566fd55..2ad57350 100644
+--- a/patches/src/main/kotlin/app/crimera/patches/instagram/entity/mediadata/Fingerprint.kt
++++ b/patches/src/main/kotlin/app/crimera/patches/instagram/entity/mediadata/Fingerprint.kt
+@@ -115,7 +115,7 @@ internal object GetMoreExtendedDataExtensionFingerprint : Fingerprint(
+ 
+ internal object GetPostTypeExtensionFingerprint : Fingerprint(
+     definingClass = EXTENSION_CLASS_DESCRIPTOR,
+-    name = "getPostType",
++    name = "getPostTypeKey",
+ )
+ 
+ // -----------------------------------
+diff --git a/patches/src/main/kotlin/app/crimera/patches/instagram/misc/history/FeedViewHistoryPatch.kt b/patches/src/main/kotlin/app/crimera/patches/instagram/misc/history/FeedViewHistoryPatch.kt
+new file mode 100644
+index 00000000..be8dddfe
+--- /dev/null
++++ b/patches/src/main/kotlin/app/crimera/patches/instagram/misc/history/FeedViewHistoryPatch.kt
+@@ -0,0 +1,85 @@
++/*
++ * Copyright (C) 2026 piko <https://github.com/crimera/piko>
++ *
++ * See the included NOTICE file for GPLv3 §7(b) terms that apply to this code.
++ */
++
++package app.crimera.patches.instagram.misc.history
++
++import app.crimera.patches.instagram.entity.decoder.CURRENT_MEDIA_FIELD
++import app.crimera.patches.instagram.entity.decoder.MEDIA_ADD_INFO_CLASS_NAME
++import app.crimera.patches.instagram.entity.decoder.MEDIA_CLASS_NAME
++import app.crimera.patches.instagram.entity.decoder.decoderEntity
++import app.crimera.patches.instagram.utils.Constants.COMPATIBILITY_INSTAGRAM
++import app.crimera.patches.instagram.utils.Constants.INTEGRATIONS_PACKAGE
++import app.crimera.patches.instagram.utils.Constants.USER_SESSION_CLASS
++import app.morphe.patcher.Fingerprint
++import app.morphe.patcher.extensions.InstructionExtensions.addInstructions
++import app.morphe.patcher.extensions.InstructionExtensions.instructions
++import app.morphe.patcher.patch.PatchException
++import app.morphe.patcher.patch.bytecodePatch
++import app.morphe.util.findFreeRegister
++import com.android.tools.smali.dexlib2.Opcode
++import com.android.tools.smali.dexlib2.iface.instruction.OneRegisterInstruction
++import com.android.tools.smali.dexlib2.iface.instruction.ReferenceInstruction
++import com.android.tools.smali.dexlib2.iface.reference.TypeReference
++
++// Feed "viewed impression" callback, called once a post has actually been on screen (not for
++// prefetched rows). The Media and carousel state arguments are cast in the method body.
++private object FeedViewedImpressionFingerprint : Fingerprint(
++    returnType = "V",
++    parameters = listOf("Ljava/lang/Object;", "J", "Ljava/lang/Object;"),
++    strings = listOf("viewed_impression", "instagram_organic_viewed_impression"),
++)
++
++private const val VIEW_HISTORY_HOOK_CLASS = "$INTEGRATIONS_PACKAGE/patches/history/ViewHistoryHook;"
++
++@Suppress("unused")
++val feedViewHistoryPatch =
++    bytecodePatch(
++        name = "Log feed posts to view history",
++        description = "Records each feed post to Piko's view history once it has been on screen.",
++        default = true,
++    ) {
++        dependsOn(viewHistorySettingsPatch, decoderEntity)
++        compatibleWith(COMPATIBILITY_INSTAGRAM)
++
++        execute {
++            FeedViewedImpressionFingerprint.method.apply {
++                fun fail(what: String): Nothing = throw PatchException("Feed view history: $what not found")
++
++                fun castIndex(type: String) =
++                    instructions.indexOfFirst {
++                        it.opcode == Opcode.CHECK_CAST &&
++                            ((it as ReferenceInstruction).reference as TypeReference).type == type
++                    }.takeIf { it >= 0 } ?: fail("$type cast")
++
++                val mediaCast = castIndex(MEDIA_CLASS_NAME)
++                val carouselCast = castIndex(MEDIA_ADD_INFO_CLASS_NAME)
++                val mediaReg = (instructions[mediaCast] as OneRegisterInstruction).registerA
++                val carouselReg = (instructions[carouselCast] as OneRegisterInstruction).registerA
++                val userSessionField =
++                    FeedViewedImpressionFingerprint.classDef.fields.firstOrNull { it.type == USER_SESSION_CLASS }
++                        ?: fail("user session")
++
++                // Right after both casts, before Instagram's own early return that skips the logging.
++                val insertIndex = maxOf(mediaCast, carouselCast) + 1
++                val used = mutableListOf(mediaReg, carouselReg)
++                fun freeRegister() = findFreeRegister(insertIndex, used).also { used += it }
++                val sessionReg = freeRegister()
++                val indexReg = freeRegister()
++                // iget and non-range invoke only encode v0-v15.
++                if (used.any { it > 15 }) fail("low registers")
++
++                addInstructions(
++                    insertIndex,
++                    """
++                    move-object/from16 v$sessionReg, p0
++                    iget-object v$sessionReg, v$sessionReg, $userSessionField
++                    iget v$indexReg, v$carouselReg, $CURRENT_MEDIA_FIELD
++                    invoke-static {v$mediaReg, v$sessionReg, v$indexReg}, $VIEW_HISTORY_HOOK_CLASS->logMediaView(Ljava/lang/Object;Lcom/instagram/common/session/UserSession;I)V
++                    """.trimIndent(),
++                )
++            }
++        }
++    }
+diff --git a/patches/src/main/kotlin/app/crimera/patches/instagram/misc/history/HistoryResourcePatch.kt b/patches/src/main/kotlin/app/crimera/patches/instagram/misc/history/HistoryResourcePatch.kt
+new file mode 100644
+index 00000000..0844a955
+--- /dev/null
++++ b/patches/src/main/kotlin/app/crimera/patches/instagram/misc/history/HistoryResourcePatch.kt
+@@ -0,0 +1,27 @@
++/*
++ * Copyright (C) 2026 piko <https://github.com/crimera/piko>
++ *
++ * See the included NOTICE file for GPLv3 §7(b) terms that apply to this code.
++ */
++
++package app.crimera.patches.instagram.misc.history
++
++import app.morphe.patcher.patch.resourcePatch
++import org.w3c.dom.Element
++
++val historyResourcePatch =
++    resourcePatch(
++        description = "Adds the view-history viewer activity to the Android manifest.",
++    ) {
++        finalize {
++            document("AndroidManifest.xml").use { document ->
++                val application = document.getElementsByTagName("application").item(0) as Element
++
++                val activity = document.createElement("activity")
++                activity.setAttribute("android:name", "app.morphe.extension.instagram.patches.history.HistoryActivity")
++                activity.setAttribute("android:theme", "@android:style/Theme.DeviceDefault.NoActionBar")
++                activity.setAttribute("android:exported", "false")
++                application.appendChild(activity)
++            }
++        }
++    }
+diff --git a/patches/src/main/kotlin/app/crimera/patches/instagram/misc/history/ReelsViewHistoryPatch.kt b/patches/src/main/kotlin/app/crimera/patches/instagram/misc/history/ReelsViewHistoryPatch.kt
+new file mode 100644
+index 00000000..c1ff9e45
+--- /dev/null
++++ b/patches/src/main/kotlin/app/crimera/patches/instagram/misc/history/ReelsViewHistoryPatch.kt
+@@ -0,0 +1,89 @@
++/*
++ * Copyright (C) 2026 piko <https://github.com/crimera/piko>
++ *
++ * See the included NOTICE file for GPLv3 §7(b) terms that apply to this code.
++ */
++
++package app.crimera.patches.instagram.misc.history
++
++import app.crimera.patches.instagram.entity.decoder.MEDIA_CLASS_NAME
++import app.crimera.patches.instagram.entity.decoder.decoderEntity
++import app.crimera.patches.instagram.utils.Constants.COMPATIBILITY_INSTAGRAM
++import app.crimera.patches.instagram.utils.Constants.INTEGRATIONS_PACKAGE
++import app.crimera.patches.instagram.utils.Constants.USER_SESSION_CLASS
++import app.morphe.patcher.Fingerprint
++import app.morphe.patcher.extensions.InstructionExtensions.addInstructionsWithLabels
++import app.morphe.patcher.extensions.InstructionExtensions.instructions
++import app.morphe.patcher.patch.PatchException
++import app.morphe.patcher.patch.bytecodePatch
++import app.morphe.util.findFreeRegister
++import com.android.tools.smali.dexlib2.Opcode
++import com.android.tools.smali.dexlib2.iface.instruction.OneRegisterInstruction
++import com.android.tools.smali.dexlib2.iface.instruction.ReferenceInstruction
++import com.android.tools.smali.dexlib2.iface.reference.MethodReference
++
++// Reels viewer onPageSelected(newPosition, oldPosition). Its first call to a private helper of the
++// listener resolves the clips item at the new position.
++private object ClipsPageSelectedFingerprint : Fingerprint(
++    returnType = "V",
++    parameters = listOf("I", "I"),
++    strings = listOf("ClipsViewerViewPagerListener.onPageSelected"),
++)
++
++private const val VIEW_HISTORY_HOOK_CLASS = "$INTEGRATIONS_PACKAGE/patches/history/ViewHistoryHook;"
++
++@Suppress("unused")
++val reelsViewHistoryPatch =
++    bytecodePatch(
++        name = "Log Reels to view history",
++        description = "Records each Reel to Piko's view history as it is shown in the Reels viewer.",
++        default = true,
++    ) {
++        dependsOn(viewHistorySettingsPatch, decoderEntity)
++        compatibleWith(COMPATIBILITY_INSTAGRAM)
++
++        execute {
++            fun fail(what: String): Nothing = throw PatchException("Reels view history: $what not found")
++
++            val listenerClass = ClipsPageSelectedFingerprint.classDef
++            ClipsPageSelectedFingerprint.method.apply {
++                val itemLookup =
++                    instructions.indexOfFirst {
++                        it.opcode == Opcode.INVOKE_DIRECT &&
++                            ((it as ReferenceInstruction).reference as MethodReference).definingClass == listenerClass.type
++                    }.takeIf { it >= 0 } ?: fail("clips item lookup")
++                val itemClass = ((instructions[itemLookup] as ReferenceInstruction).reference as MethodReference).returnType
++                val itemResult = instructions[itemLookup + 1]
++                if (itemResult.opcode != Opcode.MOVE_RESULT_OBJECT) fail("clips item result")
++                val itemReg = (itemResult as OneRegisterInstruction).registerA
++
++                val mediaField =
++                    classDefBy(itemClass).fields.singleOrNull { it.type == MEDIA_CLASS_NAME } ?: fail("clips item media")
++                val userSessionField =
++                    listenerClass.fields.firstOrNull { it.type == USER_SESSION_CLASS } ?: fail("user session")
++
++                val insertIndex = itemLookup + 2
++                val used = mutableListOf(itemReg)
++                fun freeRegister() = findFreeRegister(insertIndex, used).also { used += it }
++                val sessionReg = freeRegister()
++                val mediaReg = freeRegister()
++                val indexReg = freeRegister()
++                // iget and non-range invoke only encode v0-v15.
++                if (used.any { it > 15 }) fail("low registers")
++
++                addInstructionsWithLabels(
++                    insertIndex,
++                    """
++                    if-eqz v$itemReg, :piko_skip
++                    iget-object v$mediaReg, v$itemReg, $mediaField
++                    move-object/from16 v$sessionReg, p0
++                    iget-object v$sessionReg, v$sessionReg, $userSessionField
++                    const/4 v$indexReg, 0x0
++                    invoke-static {v$mediaReg, v$sessionReg, v$indexReg}, $VIEW_HISTORY_HOOK_CLASS->logMediaView(Ljava/lang/Object;Lcom/instagram/common/session/UserSession;I)V
++                    :piko_skip
++                    nop
++                    """.trimIndent(),
++                )
++            }
++        }
++    }
+diff --git a/patches/src/main/kotlin/app/crimera/patches/instagram/misc/history/StoriesViewHistoryPatch.kt b/patches/src/main/kotlin/app/crimera/patches/instagram/misc/history/StoriesViewHistoryPatch.kt
+new file mode 100644
+index 00000000..339daf6c
+--- /dev/null
++++ b/patches/src/main/kotlin/app/crimera/patches/instagram/misc/history/StoriesViewHistoryPatch.kt
+@@ -0,0 +1,78 @@
++/*
++ * Copyright (C) 2026 piko <https://github.com/crimera/piko>
++ *
++ * See the included NOTICE file for GPLv3 §7(b) terms that apply to this code.
++ */
++
++package app.crimera.patches.instagram.misc.history
++
++import app.crimera.patches.instagram.entity.decoder.MEDIA_CLASS_NAME
++import app.crimera.patches.instagram.entity.decoder.decoderEntity
++import app.crimera.patches.instagram.utils.Constants.COMPATIBILITY_INSTAGRAM
++import app.crimera.patches.instagram.utils.Constants.INTEGRATIONS_PACKAGE
++import app.morphe.patcher.Fingerprint
++import app.morphe.patcher.extensions.InstructionExtensions.addInstructions
++import app.morphe.patcher.patch.PatchException
++import app.morphe.patcher.patch.bytecodePatch
++import app.morphe.util.findFreeRegister
++import com.android.tools.smali.dexlib2.AccessFlags
++
++private const val REEL_VIEWER_FRAGMENT_CLASS = "Linstagram/features/stories/fragment/ReelViewerFragment;"
++private const val REEL_ITEM_CLASS = "Lcom/instagram/model/reels/ReelItem;"
++
++// Called when a story item becomes the one on screen in the story viewer (not when neighbouring
++// items are preloaded). Anchored on its own trace name.
++private object StoryActiveItemBoundFingerprint : Fingerprint(
++    definingClass = REEL_VIEWER_FRAGMENT_CLASS,
++    returnType = "V",
++    custom = { method, _ -> method.parameterTypes.firstOrNull() == REEL_ITEM_CLASS },
++    strings = listOf("ReelViewerFragment.onCurrentActiveItemBound"),
++)
++
++private const val VIEW_HISTORY_HOOK_CLASS = "$INTEGRATIONS_PACKAGE/patches/history/ViewHistoryHook;"
++
++@Suppress("unused")
++val storiesViewHistoryPatch =
++    bytecodePatch(
++        name = "Log stories to view history",
++        description = "Records each story item to Piko's view history as it is shown in the story viewer.",
++        default = true,
++    ) {
++        dependsOn(viewHistorySettingsPatch, decoderEntity)
++        compatibleWith(COMPATIBILITY_INSTAGRAM)
++
++        execute {
++            fun fail(what: String): Nothing = throw PatchException("Stories view history: $what not found")
++
++            // The item's Media (null for non-media items such as live). ReelItem has two Media
++            // fields; this is the only final one.
++            val mediaField =
++                classDefBy(REEL_ITEM_CLASS).fields
++                    .singleOrNull { it.type == MEDIA_CLASS_NAME && AccessFlags.FINAL.isSet(it.accessFlags) }
++                    ?: fail("ReelItem media field")
++
++            StoryActiveItemBoundFingerprint.method.apply {
++                val used = mutableListOf<Int>()
++                fun freeRegister() = findFreeRegister(0, used).also { used += it }
++                val sessionReg = freeRegister()
++                val mediaReg = freeRegister()
++                val indexReg = freeRegister()
++                // iget and non-range invoke only encode v0-v15.
++                if (used.any { it > 15 }) fail("low registers")
++
++                // No branches: the extension ignores a null media.
++                addInstructions(
++                    0,
++                    """
++                    move-object/from16 v$sessionReg, p0
++                    invoke-virtual {v$sessionReg}, $REEL_VIEWER_FRAGMENT_CLASS->getSession()Lcom/instagram/common/session/UserSession;
++                    move-result-object v$sessionReg
++                    move-object/from16 v$mediaReg, p1
++                    iget-object v$mediaReg, v$mediaReg, $mediaField
++                    const/4 v$indexReg, 0x0
++                    invoke-static {v$mediaReg, v$sessionReg, v$indexReg}, $VIEW_HISTORY_HOOK_CLASS->logMediaView(Ljava/lang/Object;Lcom/instagram/common/session/UserSession;I)V
++                    """.trimIndent(),
++                )
++            }
++        }
++    }
+diff --git a/patches/src/main/kotlin/app/crimera/patches/instagram/misc/history/ViewHistorySettingsPatch.kt b/patches/src/main/kotlin/app/crimera/patches/instagram/misc/history/ViewHistorySettingsPatch.kt
+new file mode 100644
+index 00000000..0f6c19a6
+--- /dev/null
++++ b/patches/src/main/kotlin/app/crimera/patches/instagram/misc/history/ViewHistorySettingsPatch.kt
+@@ -0,0 +1,27 @@
++/*
++ * Copyright (C) 2026 piko <https://github.com/crimera/piko>
++ *
++ * See the included NOTICE file for GPLv3 §7(b) terms that apply to this code.
++ */
++
++package app.crimera.patches.instagram.misc.history
++
++import app.crimera.patches.instagram.misc.settings.settingsPatch
++import app.crimera.patches.instagram.utils.Constants.COMPATIBILITY_INSTAGRAM
++import app.crimera.patches.instagram.utils.enableSettings
++import app.morphe.patcher.patch.bytecodePatch
++
++@Suppress("unused")
++val viewHistorySettingsPatch =
++    bytecodePatch(
++        name = "View history",
++        description = "Adds a History settings section to browse the feed posts, Reels and Stories you've viewed.",
++        default = true,
++    ) {
++        dependsOn(settingsPatch, historyResourcePatch)
++        compatibleWith(COMPATIBILITY_INSTAGRAM)
++
++        execute {
++            enableSettings("saveViewHistory")
++        }
++    }
+diff --git a/patches/src/main/resources/addresources/values/instagram/strings.xml b/patches/src/main/resources/addresources/values/instagram/strings.xml
+index ebb41632..5b7e4a67 100644
+--- a/patches/src/main/resources/addresources/values/instagram/strings.xml
++++ b/patches/src/main/resources/addresources/values/instagram/strings.xml
+@@ -484,4 +484,18 @@
+     <string name="piko_media_like">like</string>
+     <string name="piko_media_link">link</string>
+     <string name="piko_media_activity">activity</string>
++
++    <!-- View history -->
++    <string name="piko_category_history">History</string>
++    <string name="piko_save_view_history">Save view history</string>
++    <string name="piko_save_view_history_desc">Keeps a local list of the last 2000 feed posts, Reels and Stories you\'ve viewed, so you can find them again.</string>
++    <string name="piko_view_history">View history</string>
++    <string name="piko_no_view_history">Nothing here yet.\nPosts, Reels and Stories you view will show up here.</string>
++    <string name="piko_clear_view_history">Clear</string>
++    <string name="piko_history_copy_link">Copy link</string>
++    <string name="piko_clear_view_history_confirm">Clear your entire view history?</string>
++    <string name="piko_delete_view_history_confirm">Remove this item from your view history?</string>
++    <string name="piko_history_type_post">Post</string>
++    <string name="piko_history_type_reel">Reel</string>
++    <string name="piko_history_type_story">Story</string>
+ </resources>
+-- 
+2.56.0.windows.4
+
