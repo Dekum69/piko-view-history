@@ -69,6 +69,11 @@ public class SettingsStatus {
     public static void inboxLock() { inboxLock = true; }
     public static boolean dmSection(){ return markChatAsRead || unlimitedReplaysOnEphemeralMedia || saveDeletedMessages || inboxLock ;}
 
+    //History section.
+    public static boolean saveViewHistory = false;
+    public static void saveViewHistory() { saveViewHistory = true; }
+    public static boolean historySection(){ return saveViewHistory; }
+
     //Story section
     public static boolean customiseStoryTimestamp = false;
     public static void customiseStoryTimestamp() {
